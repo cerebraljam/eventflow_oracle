@@ -1,5 +1,5 @@
 
-# Event flow oracle
+# Event Flow Oracle
 
 ## Objective of this notebook
 
@@ -27,11 +27,11 @@ from blackbox import generate_userlist, generate_logs
 
 
 ```python
-bit_size = 19
+bit_size = 18
 activate_real_mode = True
-activate_sampling = False
-probability_of_actually_writing = 0.9
-probability_of_keeping_sample = 0.05
+activate_sampling = True
+probability_of_actually_writing = 0.7
+probability_of_keeping_sample = 1
 
 random_seed = 42
 ```
@@ -47,11 +47,11 @@ bit_array_accuracy_test = bitarray(bit_array_accuracy_test_size)
 
 bit_array_real.setall(0)
 bit_array_accuracy_test.setall(0)
-print("Capacity for a theoritical maximum of ~{}M entries ({}MB)".format(math.floor(bit_array_size/2/1000000), bit_array_size/8/1024/1024))
+print("Capacity for a theoritical maximum of ~{}K entries ({}KB)".format(math.floor(bit_array_size/2/1024), bit_array_size/8/1024))
 print("Effective capacity for an 99% accuracy: ~{}M entries".format(math.floor(bit_array_size/2*0.3/1000000)))
 ```
 
-    Capacity for a theoritical maximum of ~0M entries (0.0625MB)
+    Capacity for a theoritical maximum of ~128K entries (32.0KB)
     Effective capacity for an 99% accuracy: ~0M entries
 
 
@@ -80,7 +80,7 @@ rulesets = [
     {"name": Template("user '$who' excessive buying behaviour"),
      "conditions": [
          {"condition": Template('$who login successfully'), "expected": True},
-         {"condition": Template('7x $who buy item'), "expected": True}
+         {"condition": Template('5x $who buy item'), "expected": True}
      ]
     }
 ]
@@ -139,8 +139,9 @@ def process_word(data, size):
     offset_sha1 = int.from_bytes(hash_sha1, "little") % size
     return {"data": data, "offsetMD5": offset_md5, "offsetSHA1": offset_sha1}
 
-def record_word(array, offset):
-    array[offset]=True
+def record_word(array, offsetMD5, offsetSHA1):
+    array[offsetMD5]=True
+    array[offsetSHA1]=True
     
 def query_oracle(array, payload):
     if array[payload['offsetMD5']] and array[payload['offsetSHA1']]:
@@ -203,8 +204,7 @@ def write_to_oracle_stage2(array, body, record_chance, keep_chance, counter=1):
         saved = False
         if random.random() < record_chance or counter > 1:
             saved = True
-            record_word(array, payload['offsetMD5'])
-            record_word(array, payload['offsetSHA1'])
+            record_word(array, payload['offsetMD5'], payload['offsetSHA1'])
 
         if random.random() < keep_chance:
             result['word'] = payload['data']
@@ -224,12 +224,19 @@ def write_to_oracle_stage1(array, event, probability_of_actually_writing=1, prob
 
     return result
 
-def check_for_applying_rules(array, rulesets, user):
+def check_for_applicable_rules(array, rulesets, user):
     customized_rulesets = customize_rules(rulesets, user)
     
     return execute_ruleset(array, customized_rulesets)
     
 def test_for_collisions(array, event):
+    # This function tries to read the exact same entry that was written by the write_to_oracle_stage1 function
+    # if both bits are true and it was actually saved, then it's a true positive
+    # if one of the two is true, this is a partial collision, but the code will normally interpret it as a "not observed"
+    # if both bits are true, and the record was not written, then we know it's a false positive
+    # if both are bits are false, and the record was not saved, then we have a true negative.
+    # if both are bits are false, and the record was saved: we have a bug with the code, because this shouldn't happen
+    
     user = event['user']
     body = event['word']
     
@@ -239,12 +246,36 @@ def test_for_collisions(array, event):
     offset_sha1 = array[payload['offsetSHA1']]
     
     event['observed'] = offset_md5 and offset_sha1
+    event['md5'] = offset_md5
+    event['sha1'] = offset_sha1
     event['accurate'] = False
     
-    if event['observed'] == event['saved']:
+    if event['saved'] == True and event['observed'] == True: # Good!
         event['accurate'] = True
+        event['judgment'] = { 
+            'tp': 1, 'tn': 0, 
+            'fp': 0, 'fn': 0
+        }
+    elif event['saved'] == True and event['observed'] == False: # oh oh
+        event['accurate'] = False
+        event['judgment'] = { 
+            'tp': 0, 'tn': 1, 
+            'fp': 0, 'fn': 0
+        }
+    elif event['saved'] == False and event['observed'] == True: # oh oh
+        event['accurate'] = False
+        event['judgment'] = { 
+            'tp': 0, 'tn': 0, 
+            'fp': 1, 'fn': 0
+        }
+    elif event['saved'] == False and event['observed'] == False: # Good!
+        event['accurate'] = True
+        event['judgment'] = { 
+            'tp': 0, 'tn': 0, 
+            'fp': 0, 'fn': 1
+        }
     else:
-        print(payload['data'], event['observed'], 'expecting', event['saved'], "returning Accurate:{}".format(event['accurate']))
+        print('what am I doing here?', payload['data'], event['observed'], 'expecting', event['saved'], "returning Accurate:{}".format(event['accurate']))
         
     return event
 ```
@@ -252,6 +283,11 @@ def test_for_collisions(array, event):
 
 ```python
 %%time
+
+def alerting_function(message, event):
+    print('ALERT!', message, event)
+
+
 def main(events):
     global bit_array_real
     global bit_array_accuracy_test
@@ -259,34 +295,67 @@ def main(events):
     global rulesets
     event_counter = 0
     sample_size = 0
-    collisions = []    
+    truePositives = []
+    trueNegatives = []
+    falsePositives = []
+    falseNegatives = []
+    identified_users = []
+    triggered_rules = []
     
-    for e in events:
+    for e in events: # This should normaly be the input for all the logs, but I am simulating, so it's a loop
         if activate_real_mode:
-            real_write_result = write_to_oracle_stage1(bit_array_real, e)
-            matching_rules = check_for_applying_rules(bit_array_real, rulesets, real_write_result['user'])
+            real_write_result = write_to_oracle_stage1(bit_array_real, 
+                                                       e)
+            
+            matching_rules = check_for_applicable_rules(bit_array_real, 
+                                                        rulesets, 
+                                                        real_write_result['user'])
 
             for m in matching_rules:
-                print(m)
+                if e['user'] not in identified_users:
+                    identified_users.append(e['user'])
+                if m['name'] not in triggered_rules:
+                    triggered_rules.append(m['name'])
+                    
+                alerting_function(m, e)
 
+
+                
         if activate_sampling:
-            sampling_write_result = write_to_oracle_stage1(bit_array_accuracy_test, e, probability_of_actually_writing, probability_of_keeping_sample)           
+            sampling_write_result = write_to_oracle_stage1(bit_array_accuracy_test, 
+                                                           e, 
+                                                           probability_of_actually_writing, 
+                                                           probability_of_keeping_sample
+                                                          )           
+            
             event_counter+=1
             if sampling_write_result['word']:
                 sample_size+=1
                 tested_event = test_for_collisions(bit_array_accuracy_test, sampling_write_result)
-
-                if not tested_event['accurate']:
-                    print('was it correctly_classified?', tested_event)
-                    collisions.append(tested_event)
                 
+                if tested_event['judgment']['tp']:
+                    truePositives.append(tested_event)
+                if tested_event['judgment']['tn']:
+                    trueNegatives.append(tested_event)
+                if tested_event['judgment']['fp']:
+                    falsePositives.append(tested_event)
+                    print(event_counter, tested_event)
+                if tested_event['judgment']['fn']:
+                    falseNegatives.append(tested_event)
     
     print("\narray capacity: {}K. used {}%".format(math.floor(bit_array_accuracy_test_size/8/1024), event_counter*2/bit_array_accuracy_test_size*100))
     if activate_sampling:
-        print("{} misclassification over {} events: {}".format(len(collisions), sample_size, len(collisions)/sample_size))
-        for c in collisions:
-            print(c)
-
+        print('true positives (good): {}'.format(len(truePositives)))
+        print('true negatives (bad): {}'.format(len(trueNegatives)))
+        print('false positives (bad): {}'.format(len(falsePositives)))
+        print('false negatives (good): {}'.format(len(falseNegatives)))
+        print("\n{} false positives over {} events: {}".format(len(falsePositives), sample_size, len(falsePositives)/sample_size))
+        for c in falsePositives:
+            print('fp', c)
+        for c in trueNegatives:
+            print('tn', c)
+    return {'identified_users': identified_users, 'triggered_rules': triggered_rules}
+            
 if random_seed:
     random.seed(random_seed)
 
@@ -296,14 +365,24 @@ bit_array_accuracy_test.setall(0)
 main(events)
 ```
 
-    {'name': "user 'bob' excessive buying behaviour", 'conditions': [{'condition': 'bob login successfully', 'expected': True}, {'condition': '7x bob buy item', 'expected': True}], 'user': 'bob'}
-    {'name': "user 'bob' excessive buying behaviour", 'conditions': [{'condition': 'bob login successfully', 'expected': True}, {'condition': '7x bob buy item', 'expected': True}], 'user': 'bob'}
-    {'name': "user 'bob' excessive buying behaviour", 'conditions': [{'condition': 'bob login successfully', 'expected': True}, {'condition': '7x bob buy item', 'expected': True}], 'user': 'bob'}
-    {'name': "user 'eve' possible account takeover to buy physical item", 'conditions': [{'condition': '5x eve login failed', 'expected': True}, {'condition': 'eve login successfully', 'expected': True}, {'condition': 'eve reset password', 'expected': False}, {'condition': 'eve change address', 'expected': True}, {'condition': 'eve buy item', 'expected': True}], 'user': 'eve'}
+    ALERT! {'name': "user 'alice' excessive buying behaviour", 'conditions': [{'condition': 'alice login successfully', 'expected': True}, {'condition': '5x alice buy item', 'expected': True}], 'user': 'alice'} {'user': 'alice', 'body': 'alice buy item'}
+    ALERT! {'name': "user 'alice' excessive buying behaviour", 'conditions': [{'condition': 'alice login successfully', 'expected': True}, {'condition': '5x alice buy item', 'expected': True}], 'user': 'alice'} {'user': 'alice', 'body': 'alice buy item'}
+    ALERT! {'name': "user 'bob' excessive buying behaviour", 'conditions': [{'condition': 'bob login successfully', 'expected': True}, {'condition': '5x bob buy item', 'expected': True}], 'user': 'bob'} {'user': 'bob', 'body': 'bob buy item'}
+    ALERT! {'name': "user 'bob' excessive buying behaviour", 'conditions': [{'condition': 'bob login successfully', 'expected': True}, {'condition': '5x bob buy item', 'expected': True}], 'user': 'bob'} {'user': 'bob', 'body': 'bob buy item'}
+    ALERT! {'name': "user 'bob' excessive buying behaviour", 'conditions': [{'condition': 'bob login successfully', 'expected': True}, {'condition': '5x bob buy item', 'expected': True}], 'user': 'bob'} {'user': 'bob', 'body': 'bob buy item'}
+    ALERT! {'name': "user 'bob' excessive buying behaviour", 'conditions': [{'condition': 'bob login successfully', 'expected': True}, {'condition': '5x bob buy item', 'expected': True}], 'user': 'bob'} {'user': 'bob', 'body': 'bob buy item'}
+    ALERT! {'name': "user 'bob' excessive buying behaviour", 'conditions': [{'condition': 'bob login successfully', 'expected': True}, {'condition': '5x bob buy item', 'expected': True}], 'user': 'bob'} {'user': 'bob', 'body': 'bob buy item'}
+    ALERT! {'name': "user 'eve' possible account takeover to buy physical item", 'conditions': [{'condition': '5x eve login failed', 'expected': True}, {'condition': 'eve login successfully', 'expected': True}, {'condition': 'eve reset password', 'expected': False}, {'condition': 'eve change address', 'expected': True}, {'condition': 'eve buy item', 'expected': True}], 'user': 'eve'} {'user': 'eve', 'body': 'eve buy item'}
     
-    array capacity: 64K. used 0.0%
-    CPU times: user 13.5 ms, sys: 151 µs, total: 13.7 ms
-    Wall time: 13.6 ms
+    array capacity: 32K. used 0.030517578125%
+    true positives (good): 34
+    true negatives (bad): 0
+    false positives (bad): 0
+    false negatives (good): 6
+    
+    0 false positives over 40 events: 0.0
+    CPU times: user 19.9 ms, sys: 1.23 ms, total: 21.1 ms
+    Wall time: 20.8 ms
 
 
 
@@ -311,7 +390,7 @@ main(events)
 if random_seed:
     random.seed(random_seed)
 
-number_of_users = 2000
+number_of_users = 1000
 all_user_lists = generate_userlist(number_of_users)
 todays_user_lists = random.sample(all_user_lists, number_of_users)
 
@@ -319,7 +398,7 @@ print(len(todays_user_lists), 'users in the database.')
 print('Type of the 15 firsts:', todays_user_lists[:15])
 ```
 
-    2000 users in the database.
+    1000 users in the database.
     Type of the 15 firsts: ['normal', 'normal', 'normal', 'normal', 'normal', 'normal', 'normal', 'normal', 'normal', 'normal', 'normal', 'normal', 'normal', 'normal', 'normal']
 
 
@@ -333,8 +412,8 @@ print(len(day1_logs), 'log events generated for', len(todays_user_lists), 'users
 print('* Bit Array capacity evaluated to {}%'.format(len(day1_logs)/(len(bit_array_real)/2) * 100))
 ```
 
-    16390 log events generated for 2000 users
-    * Bit Array capacity evaluated to 6.252288818359375%
+    8282 log events generated for 1000 users
+    * Bit Array capacity evaluated to 6.31866455078125%
 
 
 
@@ -352,17 +431,17 @@ day1_data = transform_logs_to_pandas(day1_logs)
 print(day1_data[day1_data['realtype'] == 'compromised'].head(10)[['time','user', 'action', 'status']])
 ```
 
-                        time             user              action   status
-    1    2019-01-01 00:00:22   compromised152        login failed  success
-    4    2019-01-01 00:00:27   compromised152  login successfully  success
-    5    2019-01-01 00:00:28   compromised152        view profile  success
-    6    2019-01-01 00:00:33   compromised152            buy item  success
-    7    2019-01-01 00:00:34   compromised152            buy item  success
-    10   2019-01-01 00:00:38   compromised152            buy item  success
-    11   2019-01-01 00:00:40   compromised152              logout  success
-    12   2019-01-01 00:00:41   compromised152                 end  success
-    384  2019-01-01 00:32:47  compromised1916        login failed  success
-    385  2019-01-01 00:32:51  compromised1916        login failed  success
+                        time            user              action   status
+    80   2019-01-01 00:24:58  compromised238        login failed  success
+    82   2019-01-01 00:25:03  compromised238  login successfully  success
+    83   2019-01-01 00:25:04  compromised238        view profile  success
+    84   2019-01-01 00:25:08  compromised238            buy item  success
+    85   2019-01-01 00:25:12  compromised238              logout  success
+    86   2019-01-01 00:25:14  compromised238                 end  success
+    720  2019-01-01 02:38:59  compromised454        login failed  success
+    721  2019-01-01 02:39:00  compromised454        login failed  success
+    722  2019-01-01 02:39:01  compromised454                 end  success
+    727  2019-01-01 02:40:34  compromised672        login failed  success
 
 
 
@@ -372,89 +451,218 @@ print(day1_data[day1_data['realtype'] == 'compromised'].head(10)[['time','user',
 if random_seed:
     random.seed(random_seed)
 
-
-def full_main(df):
-    global bit_array_real
-    global bit_array_accuracy_test
-    
-    global rulesets
-    event_counter = 1
-    sample_size = 0
-    collisions = []
-    
-    triggered_rules = []
-    identified_users = []
-    
-#     print(df[df['realtype'] == 'compromised'].head(10)[['time','user', 'action', 'status']])
+def pre_main(df):
+    events = []
     
     for index, row in df.iterrows():
-        e = {"user": row['user'], "body": "{} {}".format(row['user'], row['action'])}
+        events.append({"user": row['user'], "body": "{} {}".format(row['user'], row['action'])})
 
-        if activate_real_mode:
-            real_write_result = write_to_oracle_stage1(bit_array_real, e)
-            matching_rules = check_for_applying_rules(bit_array_real, rulesets, real_write_result['user'])
-
-            for m in matching_rules:
-                if m not in triggered_rules:
-                    print(m['name'])
-                    triggered_rules.append(m)
-                if m['user'] not in identified_users:
-                    identified_users.append(m['user'])
-                
-        if activate_sampling:
-            sampling_write_result = write_to_oracle_stage1(bit_array_accuracy_test, e, probability_of_actually_writing, probability_of_keeping_sample)           
-            event_counter+=1
-            
-            if sampling_write_result['word']:
-                sample_size+=1
-                tested_event = test_for_collisions(bit_array_accuracy_test, sampling_write_result)
-            
-                if not tested_event['accurate']:
-                    print('was it correctly_classified?', tested_event)
-                    collisions.append(tested_event)
-
-
-
-    print("\narray capacity: {}K. used {}%".format(math.floor(bit_array_accuracy_test_size/8/1024), event_counter*2/bit_array_accuracy_test_size*100))
-    if activate_sampling:
-        print("{} collisions over {} events: {}".format(len(collisions), event_counter, len(collisions)/event_counter))
-        for c in collisions[:10]:
-            print(c)
-    
-    return {'triggered_rules': triggered_rules, 'identified_users': identified_users}
-            
-
+    return main(events)
 
 bit_array_real.setall(0)
 bit_array_accuracy_test.setall(0)
 
-outcome = full_main(day1_data)
+outcome = pre_main(day1_data)
 ```
 
-    user 'compromised1916' possible account takeover to buy virtual item
-    user 'compromised1916' excessive buying behaviour
-    user 'normal869' excessive buying behaviour
-    user 'compromised766' excessive buying behaviour
-    user 'compromised1292' excessive buying behaviour
-    user 'compromised1636' excessive buying behaviour
-    user 'compromised1141' possible account takeover to buy virtual item
-    user 'compromised826' excessive buying behaviour
-    user 'compromised1715' excessive buying behaviour
-    user 'normal306' excessive buying behaviour
-    user 'compromised1323' excessive buying behaviour
-    user 'compromised652' excessive buying behaviour
-    user 'compromised1221' possible account takeover to buy virtual item
-    user 'compromised1221' excessive buying behaviour
-    user 'compromised272' excessive buying behaviour
-    user 'compromised743' excessive buying behaviour
-    user 'compromised250' possible account takeover to buy virtual item
-    user 'compromised250' excessive buying behaviour
-    user 'compromised1295' possible account takeover to buy virtual item
-    user 'compromised1295' excessive buying behaviour
+    ALERT! {'name': "user 'normal700' excessive buying behaviour", 'conditions': [{'condition': 'normal700 login successfully', 'expected': True}, {'condition': '5x normal700 buy item', 'expected': True}], 'user': 'normal700'} {'user': 'normal700', 'body': 'normal700 buy item'}
+    ALERT! {'name': "user 'normal700' excessive buying behaviour", 'conditions': [{'condition': 'normal700 login successfully', 'expected': True}, {'condition': '5x normal700 buy item', 'expected': True}], 'user': 'normal700'} {'user': 'normal700', 'body': 'normal700 view item'}
+    ALERT! {'name': "user 'normal700' excessive buying behaviour", 'conditions': [{'condition': 'normal700 login successfully', 'expected': True}, {'condition': '5x normal700 buy item', 'expected': True}], 'user': 'normal700'} {'user': 'normal700', 'body': 'normal700 buy item'}
+    ALERT! {'name': "user 'normal700' excessive buying behaviour", 'conditions': [{'condition': 'normal700 login successfully', 'expected': True}, {'condition': '5x normal700 buy item', 'expected': True}], 'user': 'normal700'} {'user': 'normal700', 'body': 'normal700 logout'}
+    ALERT! {'name': "user 'normal700' excessive buying behaviour", 'conditions': [{'condition': 'normal700 login successfully', 'expected': True}, {'condition': '5x normal700 buy item', 'expected': True}], 'user': 'normal700'} {'user': 'normal700', 'body': 'normal700 end'}
+    ALERT! {'name': "user 'normal402' excessive buying behaviour", 'conditions': [{'condition': 'normal402 login successfully', 'expected': True}, {'condition': '5x normal402 buy item', 'expected': True}], 'user': 'normal402'} {'user': 'normal402', 'body': 'normal402 buy item'}
+    ALERT! {'name': "user 'normal402' excessive buying behaviour", 'conditions': [{'condition': 'normal402 login successfully', 'expected': True}, {'condition': '5x normal402 buy item', 'expected': True}], 'user': 'normal402'} {'user': 'normal402', 'body': 'normal402 end'}
+    ALERT! {'name': "user 'normal336' excessive buying behaviour", 'conditions': [{'condition': 'normal336 login successfully', 'expected': True}, {'condition': '5x normal336 buy item', 'expected': True}], 'user': 'normal336'} {'user': 'normal336', 'body': 'normal336 buy item'}
+    ALERT! {'name': "user 'normal336' excessive buying behaviour", 'conditions': [{'condition': 'normal336 login successfully', 'expected': True}, {'condition': '5x normal336 buy item', 'expected': True}], 'user': 'normal336'} {'user': 'normal336', 'body': 'normal336 end'}
+    ALERT! {'name': "user 'normal682' excessive buying behaviour", 'conditions': [{'condition': 'normal682 login successfully', 'expected': True}, {'condition': '5x normal682 buy item', 'expected': True}], 'user': 'normal682'} {'user': 'normal682', 'body': 'normal682 buy item'}
+    ALERT! {'name': "user 'normal682' excessive buying behaviour", 'conditions': [{'condition': 'normal682 login successfully', 'expected': True}, {'condition': '5x normal682 buy item', 'expected': True}], 'user': 'normal682'} {'user': 'normal682', 'body': 'normal682 end'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 view item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 view item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 view item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 view item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 view item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 view item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 view item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 buy item'}
+    ALERT! {'name': "user 'compromised196' excessive buying behaviour", 'conditions': [{'condition': 'compromised196 login successfully', 'expected': True}, {'condition': '5x compromised196 buy item', 'expected': True}], 'user': 'compromised196'} {'user': 'compromised196', 'body': 'compromised196 end'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' excessive buying behaviour", 'conditions': [{'condition': 'compromised516 login successfully', 'expected': True}, {'condition': '5x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' excessive buying behaviour", 'conditions': [{'condition': 'compromised516 login successfully', 'expected': True}, {'condition': '5x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' excessive buying behaviour", 'conditions': [{'condition': 'compromised516 login successfully', 'expected': True}, {'condition': '5x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' excessive buying behaviour", 'conditions': [{'condition': 'compromised516 login successfully', 'expected': True}, {'condition': '5x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 view item'}
+    ALERT! {'name': "user 'compromised516' excessive buying behaviour", 'conditions': [{'condition': 'compromised516 login successfully', 'expected': True}, {'condition': '5x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 view item'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 view item'}
+    ALERT! {'name': "user 'compromised516' excessive buying behaviour", 'conditions': [{'condition': 'compromised516 login successfully', 'expected': True}, {'condition': '5x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 view item'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 view item'}
+    ALERT! {'name': "user 'compromised516' excessive buying behaviour", 'conditions': [{'condition': 'compromised516 login successfully', 'expected': True}, {'condition': '5x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 view item'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' excessive buying behaviour", 'conditions': [{'condition': 'compromised516 login successfully', 'expected': True}, {'condition': '5x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' excessive buying behaviour", 'conditions': [{'condition': 'compromised516 login successfully', 'expected': True}, {'condition': '5x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 buy item'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 logout'}
+    ALERT! {'name': "user 'compromised516' excessive buying behaviour", 'conditions': [{'condition': 'compromised516 login successfully', 'expected': True}, {'condition': '5x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 logout'}
+    ALERT! {'name': "user 'compromised516' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised516 login failed', 'expected': True}, {'condition': 'compromised516 login successfully', 'expected': True}, {'condition': 'compromised516 reset password', 'expected': False}, {'condition': 'compromised516 change email', 'expected': True}, {'condition': '2x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 end'}
+    ALERT! {'name': "user 'compromised516' excessive buying behaviour", 'conditions': [{'condition': 'compromised516 login successfully', 'expected': True}, {'condition': '5x compromised516 buy item', 'expected': True}], 'user': 'compromised516'} {'user': 'compromised516', 'body': 'compromised516 end'}
+    ALERT! {'name': "user 'compromised253' excessive buying behaviour", 'conditions': [{'condition': 'compromised253 login successfully', 'expected': True}, {'condition': '5x compromised253 buy item', 'expected': True}], 'user': 'compromised253'} {'user': 'compromised253', 'body': 'compromised253 buy item'}
+    ALERT! {'name': "user 'compromised253' excessive buying behaviour", 'conditions': [{'condition': 'compromised253 login successfully', 'expected': True}, {'condition': '5x compromised253 buy item', 'expected': True}], 'user': 'compromised253'} {'user': 'compromised253', 'body': 'compromised253 buy item'}
+    ALERT! {'name': "user 'compromised253' excessive buying behaviour", 'conditions': [{'condition': 'compromised253 login successfully', 'expected': True}, {'condition': '5x compromised253 buy item', 'expected': True}], 'user': 'compromised253'} {'user': 'compromised253', 'body': 'compromised253 buy item'}
+    ALERT! {'name': "user 'compromised253' excessive buying behaviour", 'conditions': [{'condition': 'compromised253 login successfully', 'expected': True}, {'condition': '5x compromised253 buy item', 'expected': True}], 'user': 'compromised253'} {'user': 'compromised253', 'body': 'compromised253 buy item'}
+    ALERT! {'name': "user 'compromised253' excessive buying behaviour", 'conditions': [{'condition': 'compromised253 login successfully', 'expected': True}, {'condition': '5x compromised253 buy item', 'expected': True}], 'user': 'compromised253'} {'user': 'compromised253', 'body': 'compromised253 end'}
+    ALERT! {'name': "user 'normal440' excessive buying behaviour", 'conditions': [{'condition': 'normal440 login successfully', 'expected': True}, {'condition': '5x normal440 buy item', 'expected': True}], 'user': 'normal440'} {'user': 'normal440', 'body': 'normal440 buy item'}
+    ALERT! {'name': "user 'normal440' excessive buying behaviour", 'conditions': [{'condition': 'normal440 login successfully', 'expected': True}, {'condition': '5x normal440 buy item', 'expected': True}], 'user': 'normal440'} {'user': 'normal440', 'body': 'normal440 logout'}
+    ALERT! {'name': "user 'normal440' excessive buying behaviour", 'conditions': [{'condition': 'normal440 login successfully', 'expected': True}, {'condition': '5x normal440 buy item', 'expected': True}], 'user': 'normal440'} {'user': 'normal440', 'body': 'normal440 end'}
+    ALERT! {'name': "user 'normal676' excessive buying behaviour", 'conditions': [{'condition': 'normal676 login successfully', 'expected': True}, {'condition': '5x normal676 buy item', 'expected': True}], 'user': 'normal676'} {'user': 'normal676', 'body': 'normal676 buy item'}
+    ALERT! {'name': "user 'normal676' excessive buying behaviour", 'conditions': [{'condition': 'normal676 login successfully', 'expected': True}, {'condition': '5x normal676 buy item', 'expected': True}], 'user': 'normal676'} {'user': 'normal676', 'body': 'normal676 end'}
+    ALERT! {'name': "user 'normal712' excessive buying behaviour", 'conditions': [{'condition': 'normal712 login successfully', 'expected': True}, {'condition': '5x normal712 buy item', 'expected': True}], 'user': 'normal712'} {'user': 'normal712', 'body': 'normal712 buy item'}
+    ALERT! {'name': "user 'normal712' excessive buying behaviour", 'conditions': [{'condition': 'normal712 login successfully', 'expected': True}, {'condition': '5x normal712 buy item', 'expected': True}], 'user': 'normal712'} {'user': 'normal712', 'body': 'normal712 logout'}
+    ALERT! {'name': "user 'normal712' excessive buying behaviour", 'conditions': [{'condition': 'normal712 login successfully', 'expected': True}, {'condition': '5x normal712 buy item', 'expected': True}], 'user': 'normal712'} {'user': 'normal712', 'body': 'normal712 end'}
+    ALERT! {'name': "user 'normal807' excessive buying behaviour", 'conditions': [{'condition': 'normal807 login successfully', 'expected': True}, {'condition': '5x normal807 buy item', 'expected': True}], 'user': 'normal807'} {'user': 'normal807', 'body': 'normal807 buy item'}
+    ALERT! {'name': "user 'normal807' excessive buying behaviour", 'conditions': [{'condition': 'normal807 login successfully', 'expected': True}, {'condition': '5x normal807 buy item', 'expected': True}], 'user': 'normal807'} {'user': 'normal807', 'body': 'normal807 logout'}
+    ALERT! {'name': "user 'normal807' excessive buying behaviour", 'conditions': [{'condition': 'normal807 login successfully', 'expected': True}, {'condition': '5x normal807 buy item', 'expected': True}], 'user': 'normal807'} {'user': 'normal807', 'body': 'normal807 end'}
+    ALERT! {'name': "user 'compromised763' excessive buying behaviour", 'conditions': [{'condition': 'compromised763 login successfully', 'expected': True}, {'condition': '5x compromised763 buy item', 'expected': True}], 'user': 'compromised763'} {'user': 'compromised763', 'body': 'compromised763 buy item'}
+    ALERT! {'name': "user 'compromised763' excessive buying behaviour", 'conditions': [{'condition': 'compromised763 login successfully', 'expected': True}, {'condition': '5x compromised763 buy item', 'expected': True}], 'user': 'compromised763'} {'user': 'compromised763', 'body': 'compromised763 buy item'}
+    ALERT! {'name': "user 'compromised763' excessive buying behaviour", 'conditions': [{'condition': 'compromised763 login successfully', 'expected': True}, {'condition': '5x compromised763 buy item', 'expected': True}], 'user': 'compromised763'} {'user': 'compromised763', 'body': 'compromised763 buy item'}
+    ALERT! {'name': "user 'compromised763' excessive buying behaviour", 'conditions': [{'condition': 'compromised763 login successfully', 'expected': True}, {'condition': '5x compromised763 buy item', 'expected': True}], 'user': 'compromised763'} {'user': 'compromised763', 'body': 'compromised763 buy item'}
+    ALERT! {'name': "user 'compromised763' excessive buying behaviour", 'conditions': [{'condition': 'compromised763 login successfully', 'expected': True}, {'condition': '5x compromised763 buy item', 'expected': True}], 'user': 'compromised763'} {'user': 'compromised763', 'body': 'compromised763 buy item'}
+    ALERT! {'name': "user 'compromised763' excessive buying behaviour", 'conditions': [{'condition': 'compromised763 login successfully', 'expected': True}, {'condition': '5x compromised763 buy item', 'expected': True}], 'user': 'compromised763'} {'user': 'compromised763', 'body': 'compromised763 buy item'}
+    ALERT! {'name': "user 'compromised763' excessive buying behaviour", 'conditions': [{'condition': 'compromised763 login successfully', 'expected': True}, {'condition': '5x compromised763 buy item', 'expected': True}], 'user': 'compromised763'} {'user': 'compromised763', 'body': 'compromised763 buy item'}
+    ALERT! {'name': "user 'compromised763' excessive buying behaviour", 'conditions': [{'condition': 'compromised763 login successfully', 'expected': True}, {'condition': '5x compromised763 buy item', 'expected': True}], 'user': 'compromised763'} {'user': 'compromised763', 'body': 'compromised763 buy item'}
+    ALERT! {'name': "user 'compromised763' excessive buying behaviour", 'conditions': [{'condition': 'compromised763 login successfully', 'expected': True}, {'condition': '5x compromised763 buy item', 'expected': True}], 'user': 'compromised763'} {'user': 'compromised763', 'body': 'compromised763 end'}
+    ALERT! {'name': "user 'normal865' excessive buying behaviour", 'conditions': [{'condition': 'normal865 login successfully', 'expected': True}, {'condition': '5x normal865 buy item', 'expected': True}], 'user': 'normal865'} {'user': 'normal865', 'body': 'normal865 buy item'}
+    ALERT! {'name': "user 'normal865' excessive buying behaviour", 'conditions': [{'condition': 'normal865 login successfully', 'expected': True}, {'condition': '5x normal865 buy item', 'expected': True}], 'user': 'normal865'} {'user': 'normal865', 'body': 'normal865 buy item'}
+    ALERT! {'name': "user 'normal865' excessive buying behaviour", 'conditions': [{'condition': 'normal865 login successfully', 'expected': True}, {'condition': '5x normal865 buy item', 'expected': True}], 'user': 'normal865'} {'user': 'normal865', 'body': 'normal865 end'}
+    ALERT! {'name': "user 'normal7' excessive buying behaviour", 'conditions': [{'condition': 'normal7 login successfully', 'expected': True}, {'condition': '5x normal7 buy item', 'expected': True}], 'user': 'normal7'} {'user': 'normal7', 'body': 'normal7 buy item'}
+    ALERT! {'name': "user 'normal7' excessive buying behaviour", 'conditions': [{'condition': 'normal7 login successfully', 'expected': True}, {'condition': '5x normal7 buy item', 'expected': True}], 'user': 'normal7'} {'user': 'normal7', 'body': 'normal7 end'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 buy item'}
+    ALERT! {'name': "user 'compromised300' excessive buying behaviour", 'conditions': [{'condition': 'compromised300 login successfully', 'expected': True}, {'condition': '5x compromised300 buy item', 'expected': True}], 'user': 'compromised300'} {'user': 'compromised300', 'body': 'compromised300 end'}
+    ALERT! {'name': "user 'normal414' excessive buying behaviour", 'conditions': [{'condition': 'normal414 login successfully', 'expected': True}, {'condition': '5x normal414 buy item', 'expected': True}], 'user': 'normal414'} {'user': 'normal414', 'body': 'normal414 buy item'}
+    ALERT! {'name': "user 'normal414' excessive buying behaviour", 'conditions': [{'condition': 'normal414 login successfully', 'expected': True}, {'condition': '5x normal414 buy item', 'expected': True}], 'user': 'normal414'} {'user': 'normal414', 'body': 'normal414 end'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' excessive buying behaviour", 'conditions': [{'condition': 'compromised434 login successfully', 'expected': True}, {'condition': '5x compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' excessive buying behaviour", 'conditions': [{'condition': 'compromised434 login successfully', 'expected': True}, {'condition': '5x compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' excessive buying behaviour", 'conditions': [{'condition': 'compromised434 login successfully', 'expected': True}, {'condition': '5x compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' excessive buying behaviour", 'conditions': [{'condition': 'compromised434 login successfully', 'expected': True}, {'condition': '5x compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 view item'}
+    ALERT! {'name': "user 'compromised434' excessive buying behaviour", 'conditions': [{'condition': 'compromised434 login successfully', 'expected': True}, {'condition': '5x compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 view item'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 view item'}
+    ALERT! {'name': "user 'compromised434' excessive buying behaviour", 'conditions': [{'condition': 'compromised434 login successfully', 'expected': True}, {'condition': '5x compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 view item'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' excessive buying behaviour", 'conditions': [{'condition': 'compromised434 login successfully', 'expected': True}, {'condition': '5x compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' excessive buying behaviour", 'conditions': [{'condition': 'compromised434 login successfully', 'expected': True}, {'condition': '5x compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' excessive buying behaviour", 'conditions': [{'condition': 'compromised434 login successfully', 'expected': True}, {'condition': '5x compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 buy item'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 logout'}
+    ALERT! {'name': "user 'compromised434' excessive buying behaviour", 'conditions': [{'condition': 'compromised434 login successfully', 'expected': True}, {'condition': '5x compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 logout'}
+    ALERT! {'name': "user 'compromised434' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised434 login failed', 'expected': True}, {'condition': 'compromised434 login successfully', 'expected': True}, {'condition': 'compromised434 reset password', 'expected': False}, {'condition': 'compromised434 change address', 'expected': True}, {'condition': 'compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 end'}
+    ALERT! {'name': "user 'compromised434' excessive buying behaviour", 'conditions': [{'condition': 'compromised434 login successfully', 'expected': True}, {'condition': '5x compromised434 buy item', 'expected': True}], 'user': 'compromised434'} {'user': 'compromised434', 'body': 'compromised434 end'}
+    ALERT! {'name': "user 'compromised354' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised354 login failed', 'expected': True}, {'condition': 'compromised354 login successfully', 'expected': True}, {'condition': 'compromised354 reset password', 'expected': False}, {'condition': 'compromised354 change address', 'expected': True}, {'condition': 'compromised354 buy item', 'expected': True}], 'user': 'compromised354'} {'user': 'compromised354', 'body': 'compromised354 buy item'}
+    ALERT! {'name': "user 'compromised354' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised354 login failed', 'expected': True}, {'condition': 'compromised354 login successfully', 'expected': True}, {'condition': 'compromised354 reset password', 'expected': False}, {'condition': 'compromised354 change address', 'expected': True}, {'condition': 'compromised354 buy item', 'expected': True}], 'user': 'compromised354'} {'user': 'compromised354', 'body': 'compromised354 view item'}
+    ALERT! {'name': "user 'compromised354' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised354 login failed', 'expected': True}, {'condition': 'compromised354 login successfully', 'expected': True}, {'condition': 'compromised354 reset password', 'expected': False}, {'condition': 'compromised354 change address', 'expected': True}, {'condition': 'compromised354 buy item', 'expected': True}], 'user': 'compromised354'} {'user': 'compromised354', 'body': 'compromised354 buy item'}
+    ALERT! {'name': "user 'compromised354' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised354 login failed', 'expected': True}, {'condition': 'compromised354 login successfully', 'expected': True}, {'condition': 'compromised354 reset password', 'expected': False}, {'condition': 'compromised354 change address', 'expected': True}, {'condition': 'compromised354 buy item', 'expected': True}], 'user': 'compromised354'} {'user': 'compromised354', 'body': 'compromised354 buy item'}
+    ALERT! {'name': "user 'compromised354' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised354 login failed', 'expected': True}, {'condition': 'compromised354 login successfully', 'expected': True}, {'condition': 'compromised354 reset password', 'expected': False}, {'condition': 'compromised354 change address', 'expected': True}, {'condition': 'compromised354 buy item', 'expected': True}], 'user': 'compromised354'} {'user': 'compromised354', 'body': 'compromised354 view item'}
+    ALERT! {'name': "user 'compromised354' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised354 login failed', 'expected': True}, {'condition': 'compromised354 login successfully', 'expected': True}, {'condition': 'compromised354 reset password', 'expected': False}, {'condition': 'compromised354 change address', 'expected': True}, {'condition': 'compromised354 buy item', 'expected': True}], 'user': 'compromised354'} {'user': 'compromised354', 'body': 'compromised354 buy item'}
+    ALERT! {'name': "user 'compromised354' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised354 login failed', 'expected': True}, {'condition': 'compromised354 login successfully', 'expected': True}, {'condition': 'compromised354 reset password', 'expected': False}, {'condition': 'compromised354 change address', 'expected': True}, {'condition': 'compromised354 buy item', 'expected': True}], 'user': 'compromised354'} {'user': 'compromised354', 'body': 'compromised354 logout'}
+    ALERT! {'name': "user 'compromised354' possible account takeover to buy physical item", 'conditions': [{'condition': '5x compromised354 login failed', 'expected': True}, {'condition': 'compromised354 login successfully', 'expected': True}, {'condition': 'compromised354 reset password', 'expected': False}, {'condition': 'compromised354 change address', 'expected': True}, {'condition': 'compromised354 buy item', 'expected': True}], 'user': 'compromised354'} {'user': 'compromised354', 'body': 'compromised354 end'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 buy item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 view item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 buy item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 buy item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 buy item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 buy item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 buy item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 buy item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 view item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 view item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 buy item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 view item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 buy item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 view item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 buy item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 view item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 buy item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 buy item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 buy item'}
+    ALERT! {'name': "user 'compromised695' excessive buying behaviour", 'conditions': [{'condition': 'compromised695 login successfully', 'expected': True}, {'condition': '5x compromised695 buy item', 'expected': True}], 'user': 'compromised695'} {'user': 'compromised695', 'body': 'compromised695 end'}
+    ALERT! {'name': "user 'compromised605' excessive buying behaviour", 'conditions': [{'condition': 'compromised605 login successfully', 'expected': True}, {'condition': '5x compromised605 buy item', 'expected': True}], 'user': 'compromised605'} {'user': 'compromised605', 'body': 'compromised605 buy item'}
+    ALERT! {'name': "user 'compromised605' excessive buying behaviour", 'conditions': [{'condition': 'compromised605 login successfully', 'expected': True}, {'condition': '5x compromised605 buy item', 'expected': True}], 'user': 'compromised605'} {'user': 'compromised605', 'body': 'compromised605 buy item'}
+    ALERT! {'name': "user 'compromised605' excessive buying behaviour", 'conditions': [{'condition': 'compromised605 login successfully', 'expected': True}, {'condition': '5x compromised605 buy item', 'expected': True}], 'user': 'compromised605'} {'user': 'compromised605', 'body': 'compromised605 logout'}
+    ALERT! {'name': "user 'compromised605' excessive buying behaviour", 'conditions': [{'condition': 'compromised605 login successfully', 'expected': True}, {'condition': '5x compromised605 buy item', 'expected': True}], 'user': 'compromised605'} {'user': 'compromised605', 'body': 'compromised605 end'}
+    ALERT! {'name': "user 'compromised961' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised961 login failed', 'expected': True}, {'condition': 'compromised961 login successfully', 'expected': True}, {'condition': 'compromised961 reset password', 'expected': False}, {'condition': 'compromised961 change email', 'expected': True}, {'condition': '2x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 buy item'}
+    ALERT! {'name': "user 'compromised961' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised961 login failed', 'expected': True}, {'condition': 'compromised961 login successfully', 'expected': True}, {'condition': 'compromised961 reset password', 'expected': False}, {'condition': 'compromised961 change email', 'expected': True}, {'condition': '2x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 buy item'}
+    ALERT! {'name': "user 'compromised961' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised961 login failed', 'expected': True}, {'condition': 'compromised961 login successfully', 'expected': True}, {'condition': 'compromised961 reset password', 'expected': False}, {'condition': 'compromised961 change email', 'expected': True}, {'condition': '2x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 buy item'}
+    ALERT! {'name': "user 'compromised961' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised961 login failed', 'expected': True}, {'condition': 'compromised961 login successfully', 'expected': True}, {'condition': 'compromised961 reset password', 'expected': False}, {'condition': 'compromised961 change email', 'expected': True}, {'condition': '2x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 buy item'}
+    ALERT! {'name': "user 'compromised961' excessive buying behaviour", 'conditions': [{'condition': 'compromised961 login successfully', 'expected': True}, {'condition': '5x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 buy item'}
+    ALERT! {'name': "user 'compromised961' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised961 login failed', 'expected': True}, {'condition': 'compromised961 login successfully', 'expected': True}, {'condition': 'compromised961 reset password', 'expected': False}, {'condition': 'compromised961 change email', 'expected': True}, {'condition': '2x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 view item'}
+    ALERT! {'name': "user 'compromised961' excessive buying behaviour", 'conditions': [{'condition': 'compromised961 login successfully', 'expected': True}, {'condition': '5x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 view item'}
+    ALERT! {'name': "user 'compromised961' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised961 login failed', 'expected': True}, {'condition': 'compromised961 login successfully', 'expected': True}, {'condition': 'compromised961 reset password', 'expected': False}, {'condition': 'compromised961 change email', 'expected': True}, {'condition': '2x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 buy item'}
+    ALERT! {'name': "user 'compromised961' excessive buying behaviour", 'conditions': [{'condition': 'compromised961 login successfully', 'expected': True}, {'condition': '5x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 buy item'}
+    ALERT! {'name': "user 'compromised961' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised961 login failed', 'expected': True}, {'condition': 'compromised961 login successfully', 'expected': True}, {'condition': 'compromised961 reset password', 'expected': False}, {'condition': 'compromised961 change email', 'expected': True}, {'condition': '2x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 buy item'}
+    ALERT! {'name': "user 'compromised961' excessive buying behaviour", 'conditions': [{'condition': 'compromised961 login successfully', 'expected': True}, {'condition': '5x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 buy item'}
+    ALERT! {'name': "user 'compromised961' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised961 login failed', 'expected': True}, {'condition': 'compromised961 login successfully', 'expected': True}, {'condition': 'compromised961 reset password', 'expected': False}, {'condition': 'compromised961 change email', 'expected': True}, {'condition': '2x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 buy item'}
+    ALERT! {'name': "user 'compromised961' excessive buying behaviour", 'conditions': [{'condition': 'compromised961 login successfully', 'expected': True}, {'condition': '5x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 buy item'}
+    ALERT! {'name': "user 'compromised961' possible account takeover to buy virtual item", 'conditions': [{'condition': '2x compromised961 login failed', 'expected': True}, {'condition': 'compromised961 login successfully', 'expected': True}, {'condition': 'compromised961 reset password', 'expected': False}, {'condition': 'compromised961 change email', 'expected': True}, {'condition': '2x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 end'}
+    ALERT! {'name': "user 'compromised961' excessive buying behaviour", 'conditions': [{'condition': 'compromised961 login successfully', 'expected': True}, {'condition': '5x compromised961 buy item', 'expected': True}], 'user': 'compromised961'} {'user': 'compromised961', 'body': 'compromised961 end'}
     
-    array capacity: 64K. used 0.0003814697265625%
-    CPU times: user 7.43 s, sys: 28.3 ms, total: 7.46 s
-    Wall time: 7.5 s
+    array capacity: 32K. used 6.31866455078125%
+    true positives (good): 6807
+    true negatives (bad): 0
+    false positives (bad): 0
+    false negatives (good): 1475
+    
+    0 false positives over 8282 events: 0.0
+    CPU times: user 3.75 s, sys: 56.1 ms, total: 3.8 s
+    Wall time: 3.79 s
 
 
 
@@ -467,25 +675,30 @@ if activate_real_mode:
     print('real number of compromised accounts: {}'.format(len(day1_data[day1_data['realtype'] == 'compromised']['user'].unique())))
 ```
 
-    Users who triggered rules: 16
-    * compromised1916
-    * normal869
-    * compromised766
-    * compromised1292
-    * compromised1636
-    * compromised1141
-    * compromised826
-    * compromised1715
-    * normal306
-    * compromised1323
-    * compromised652
-    * compromised1221
-    * compromised272
-    * compromised743
-    * compromised250
-    * compromised1295
-    total triggered rules: 20
-    real number of compromised accounts: 24
+    Users who triggered rules: 21
+    * normal700
+    * normal402
+    * normal336
+    * normal682
+    * compromised196
+    * compromised516
+    * compromised253
+    * normal440
+    * normal676
+    * normal712
+    * normal807
+    * compromised763
+    * normal865
+    * normal7
+    * compromised300
+    * normal414
+    * compromised434
+    * compromised354
+    * compromised695
+    * compromised605
+    * compromised961
+    total triggered rules: 24
+    real number of compromised accounts: 15
 
 
 
@@ -498,70 +711,70 @@ if activate_real_mode:
 ```
 
     successfully identified compromised accounts:
-                          time             user              action   status
-    384    2019-01-01 00:32:47  compromised1916        login failed  success
-    385    2019-01-01 00:32:51  compromised1916        login failed  success
-    387    2019-01-01 00:32:56  compromised1916        login failed  success
-    388    2019-01-01 00:32:57  compromised1916        login failed  success
-    389    2019-01-01 00:32:59  compromised1916        login failed  success
-    391    2019-01-01 00:33:01  compromised1916        login failed  success
-    392    2019-01-01 00:33:05  compromised1916        login failed  success
-    393    2019-01-01 00:33:08  compromised1916        login failed  success
-    394    2019-01-01 00:33:09  compromised1916  login successfully  success
-    396    2019-01-01 00:33:10  compromised1916        view profile  success
-    397    2019-01-01 00:33:15  compromised1916        change email  success
-    398    2019-01-01 00:33:20  compromised1916            buy item  success
-    400    2019-01-01 00:33:24  compromised1916            buy item  success
-    402    2019-01-01 00:33:28  compromised1916           view item  success
-    403    2019-01-01 00:33:32  compromised1916            buy item  success
-    404    2019-01-01 00:33:33  compromised1916            buy item  success
-    406    2019-01-01 00:33:34  compromised1916            buy item  success
-    407    2019-01-01 00:33:35  compromised1916            buy item  success
-    408    2019-01-01 00:33:37  compromised1916           view item  success
-    410    2019-01-01 00:33:38  compromised1916            buy item  success
-    412    2019-01-01 00:33:40  compromised1916            buy item  success
-    413    2019-01-01 00:33:43  compromised1916           view item  success
-    414    2019-01-01 00:33:48  compromised1916            buy item  success
-    418    2019-01-01 00:33:53  compromised1916                 end  success
-    4764   2019-01-01 07:22:02   compromised766        login failed  success
-    4767   2019-01-01 07:22:07   compromised766        login failed  success
-    4768   2019-01-01 07:22:08   compromised766        login failed  success
-    4770   2019-01-01 07:22:12   compromised766        login failed  success
-    4771   2019-01-01 07:22:13   compromised766  login successfully  success
-    4772   2019-01-01 07:22:14   compromised766        view profile  success
-    ...                    ...              ...                 ...      ...
-    12425  2019-01-01 18:39:28   compromised250            buy item  success
-    12426  2019-01-01 18:39:33   compromised250            buy item  success
-    12427  2019-01-01 18:39:34   compromised250            buy item  success
-    12428  2019-01-01 18:39:37   compromised250            buy item  success
-    12430  2019-01-01 18:39:42   compromised250            buy item  success
-    12432  2019-01-01 18:39:44   compromised250            buy item  success
-    12433  2019-01-01 18:39:48   compromised250           view item  success
-    12434  2019-01-01 18:39:52   compromised250           view item  success
-    12436  2019-01-01 18:39:56   compromised250           view item  success
-    12437  2019-01-01 18:40:00   compromised250            buy item  success
-    12440  2019-01-01 18:40:01   compromised250              logout  success
-    12441  2019-01-01 18:40:05   compromised250                 end  success
-    12946  2019-01-01 19:22:02  compromised1295        login failed  success
-    12947  2019-01-01 19:22:06  compromised1295        login failed  success
-    12949  2019-01-01 19:22:08  compromised1295  login successfully  success
-    12950  2019-01-01 19:22:12  compromised1295        view profile  success
-    12952  2019-01-01 19:22:16  compromised1295        change email  success
-    12955  2019-01-01 19:22:20  compromised1295            buy item  success
-    12957  2019-01-01 19:22:21  compromised1295           view item  success
-    12958  2019-01-01 19:22:24  compromised1295            buy item  success
-    12960  2019-01-01 19:22:27  compromised1295            buy item  success
-    12963  2019-01-01 19:22:30  compromised1295            buy item  success
-    12964  2019-01-01 19:22:35  compromised1295            buy item  success
-    12965  2019-01-01 19:22:40  compromised1295            buy item  success
-    12968  2019-01-01 19:22:45  compromised1295            buy item  success
-    12969  2019-01-01 19:22:49  compromised1295           view item  success
-    12971  2019-01-01 19:22:53  compromised1295           view item  success
-    12975  2019-01-01 19:22:56  compromised1295           view item  success
-    12977  2019-01-01 19:22:58  compromised1295            buy item  success
-    12978  2019-01-01 19:23:00  compromised1295                 end  success
+                         time            user              action   status
+    1339  2019-01-01 04:53:09  compromised196        login failed  success
+    1341  2019-01-01 04:53:13  compromised196        login failed  success
+    1342  2019-01-01 04:53:14  compromised196        login failed  success
+    1343  2019-01-01 04:53:15  compromised196        login failed  success
+    1346  2019-01-01 04:53:19  compromised196        login failed  success
+    1347  2019-01-01 04:53:22  compromised196        login failed  success
+    1348  2019-01-01 04:53:23  compromised196        login failed  success
+    1350  2019-01-01 04:53:26  compromised196        login failed  success
+    1351  2019-01-01 04:53:29  compromised196        login failed  success
+    1353  2019-01-01 04:53:31  compromised196        login failed  success
+    1354  2019-01-01 04:53:34  compromised196        login failed  success
+    1356  2019-01-01 04:53:35  compromised196        login failed  success
+    1358  2019-01-01 04:53:39  compromised196  login successfully  success
+    1359  2019-01-01 04:53:40  compromised196        view profile  success
+    1362  2019-01-01 04:53:45  compromised196        view profile  success
+    1364  2019-01-01 04:53:49  compromised196            buy item  success
+    1365  2019-01-01 04:53:50  compromised196           view item  success
+    1366  2019-01-01 04:53:51  compromised196            buy item  success
+    1367  2019-01-01 04:53:52  compromised196            buy item  success
+    1368  2019-01-01 04:53:54  compromised196            buy item  success
+    1370  2019-01-01 04:53:59  compromised196            buy item  success
+    1372  2019-01-01 04:54:04  compromised196            buy item  success
+    1373  2019-01-01 04:54:05  compromised196           view item  success
+    1374  2019-01-01 04:54:07  compromised196            buy item  success
+    1375  2019-01-01 04:54:08  compromised196            buy item  success
+    1376  2019-01-01 04:54:13  compromised196           view item  success
+    1378  2019-01-01 04:54:15  compromised196           view item  success
+    1379  2019-01-01 04:54:18  compromised196            buy item  success
+    1381  2019-01-01 04:54:19  compromised196            buy item  success
+    1382  2019-01-01 04:54:20  compromised196            buy item  success
+    ...                   ...             ...                 ...      ...
+    6924  2019-01-01 20:18:38  compromised695                 end  success
+    8062  2019-01-01 23:28:49  compromised605  login successfully  success
+    8063  2019-01-01 23:28:50  compromised605        view profile  success
+    8064  2019-01-01 23:28:55  compromised605        change email  success
+    8065  2019-01-01 23:28:57  compromised605            buy item  success
+    8066  2019-01-01 23:29:00  compromised605            buy item  success
+    8067  2019-01-01 23:29:01  compromised605            buy item  success
+    8069  2019-01-01 23:29:04  compromised605            buy item  success
+    8070  2019-01-01 23:29:05  compromised605            buy item  success
+    8073  2019-01-01 23:29:08  compromised605            buy item  success
+    8075  2019-01-01 23:29:12  compromised605              logout  success
+    8076  2019-01-01 23:29:16  compromised605                 end  success
+    8078  2019-01-01 23:29:35  compromised961        login failed  success
+    8079  2019-01-01 23:29:38  compromised961        login failed  success
+    8081  2019-01-01 23:29:42  compromised961        login failed  success
+    8082  2019-01-01 23:29:43  compromised961  login successfully  success
+    8083  2019-01-01 23:29:46  compromised961        view profile  success
+    8085  2019-01-01 23:29:47  compromised961        change email  success
+    8086  2019-01-01 23:29:48  compromised961            buy item  success
+    8087  2019-01-01 23:29:53  compromised961           view item  success
+    8088  2019-01-01 23:29:55  compromised961           view item  success
+    8089  2019-01-01 23:29:59  compromised961            buy item  success
+    8090  2019-01-01 23:30:00  compromised961            buy item  success
+    8091  2019-01-01 23:30:03  compromised961            buy item  success
+    8092  2019-01-01 23:30:04  compromised961            buy item  success
+    8094  2019-01-01 23:30:08  compromised961           view item  success
+    8095  2019-01-01 23:30:09  compromised961            buy item  success
+    8096  2019-01-01 23:30:12  compromised961            buy item  success
+    8097  2019-01-01 23:30:14  compromised961            buy item  success
+    8098  2019-01-01 23:30:15  compromised961                 end  success
     
-    [352 rows x 4 columns]
+    [242 rows x 4 columns]
 
 
 
@@ -574,70 +787,40 @@ if activate_real_mode:
 ```
 
     missed compromised accounts:
-                          time             user              action   status
-    1      2019-01-01 00:00:22   compromised152        login failed  success
-    4      2019-01-01 00:00:27   compromised152  login successfully  success
-    5      2019-01-01 00:00:28   compromised152        view profile  success
-    6      2019-01-01 00:00:33   compromised152            buy item  success
-    7      2019-01-01 00:00:34   compromised152            buy item  success
-    10     2019-01-01 00:00:38   compromised152            buy item  success
-    11     2019-01-01 00:00:40   compromised152              logout  success
-    12     2019-01-01 00:00:41   compromised152                 end  success
-    2003   2019-01-01 03:16:47    compromised20        login failed  success
-    2005   2019-01-01 03:16:48    compromised20        login failed  success
-    2007   2019-01-01 03:16:53    compromised20        login failed  success
-    2008   2019-01-01 03:16:54    compromised20        login failed  success
-    2009   2019-01-01 03:16:55    compromised20                 end  success
-    2154   2019-01-01 03:28:03   compromised101        login failed  success
-    2156   2019-01-01 03:28:05   compromised101                 end  success
-    4690   2019-01-01 07:16:13  compromised1733        login failed  success
-    4691   2019-01-01 07:16:14  compromised1733        login failed  success
-    4693   2019-01-01 07:16:19  compromised1733        login failed  success
-    4694   2019-01-01 07:16:20  compromised1733        login failed  success
-    4696   2019-01-01 07:16:24  compromised1733                 end  success
-    4947   2019-01-01 07:35:59  compromised1512        login failed  success
-    4948   2019-01-01 07:36:04  compromised1512        login failed  success
-    4950   2019-01-01 07:36:09  compromised1512        login failed  success
-    4952   2019-01-01 07:36:14  compromised1512        login failed  success
-    4953   2019-01-01 07:36:18  compromised1512        login failed  success
-    4954   2019-01-01 07:36:23  compromised1512        login failed  success
-    4955   2019-01-01 07:36:27  compromised1512        login failed  success
-    4956   2019-01-01 07:36:30  compromised1512        login failed  success
-    4957   2019-01-01 07:36:31  compromised1512  login successfully  success
-    4958   2019-01-01 07:36:34  compromised1512        view profile  success
-    ...                    ...              ...                 ...      ...
-    4967   2019-01-01 07:36:44  compromised1512            buy item  success
-    4968   2019-01-01 07:36:46  compromised1512           view item  success
-    4969   2019-01-01 07:36:48  compromised1512            buy item  success
-    4970   2019-01-01 07:36:50  compromised1512            buy item  success
-    4971   2019-01-01 07:36:52  compromised1512              logout  success
-    4972   2019-01-01 07:36:57  compromised1512                 end  success
-    6922   2019-01-01 10:37:50   compromised184        login failed  success
-    6923   2019-01-01 10:37:53   compromised184        login failed  success
-    6924   2019-01-01 10:37:58   compromised184        login failed  success
-    6925   2019-01-01 10:38:00   compromised184                 end  success
-    10626  2019-01-01 16:07:53   compromised321  login successfully  success
-    10629  2019-01-01 16:07:58   compromised321        view profile  success
-    10630  2019-01-01 16:08:02   compromised321      change address  success
-    10633  2019-01-01 16:08:06   compromised321            buy item  success
-    10636  2019-01-01 16:08:11   compromised321            buy item  success
-    10637  2019-01-01 16:08:13   compromised321           view item  success
-    10639  2019-01-01 16:08:14   compromised321            buy item  success
-    10643  2019-01-01 16:08:17   compromised321            buy item  success
-    10644  2019-01-01 16:08:19   compromised321                 end  success
-    12267  2019-01-01 18:23:29   compromised372        login failed  success
-    12268  2019-01-01 18:23:30   compromised372        login failed  success
-    12269  2019-01-01 18:23:31   compromised372        login failed  success
-    12271  2019-01-01 18:23:34   compromised372        login failed  success
-    12272  2019-01-01 18:23:39   compromised372        login failed  success
-    12273  2019-01-01 18:23:43   compromised372        login failed  success
-    12274  2019-01-01 18:23:45   compromised372        login failed  success
-    12276  2019-01-01 18:23:50   compromised372        login failed  success
-    12277  2019-01-01 18:23:51   compromised372                 end  success
-    14150  2019-01-01 20:48:05  compromised1699        login failed  success
-    14151  2019-01-01 20:48:06  compromised1699                 end  success
-    
-    [66 rows x 4 columns]
+                         time            user              action   status
+    80    2019-01-01 00:24:58  compromised238        login failed  success
+    82    2019-01-01 00:25:03  compromised238  login successfully  success
+    83    2019-01-01 00:25:04  compromised238        view profile  success
+    84    2019-01-01 00:25:08  compromised238            buy item  success
+    85    2019-01-01 00:25:12  compromised238              logout  success
+    86    2019-01-01 00:25:14  compromised238                 end  success
+    720   2019-01-01 02:38:59  compromised454        login failed  success
+    721   2019-01-01 02:39:00  compromised454        login failed  success
+    722   2019-01-01 02:39:01  compromised454                 end  success
+    727   2019-01-01 02:40:34  compromised672        login failed  success
+    728   2019-01-01 02:40:36  compromised672        login failed  success
+    729   2019-01-01 02:40:41  compromised672        login failed  success
+    730   2019-01-01 02:40:42  compromised672        login failed  success
+    732   2019-01-01 02:40:47  compromised672        login failed  success
+    733   2019-01-01 02:40:51  compromised672        login failed  success
+    734   2019-01-01 02:40:53  compromised672        login failed  success
+    735   2019-01-01 02:40:58  compromised672        login failed  success
+    737   2019-01-01 02:41:01  compromised672                 end  success
+    884   2019-01-01 03:07:12  compromised668        login failed  success
+    885   2019-01-01 03:07:13  compromised668  login successfully  success
+    886   2019-01-01 03:07:15  compromised668        view profile  success
+    887   2019-01-01 03:07:18  compromised668            buy item  success
+    888   2019-01-01 03:07:22  compromised668                 end  success
+    2794  2019-01-01 09:00:35  compromised269        login failed  success
+    2795  2019-01-01 09:00:36  compromised269        login failed  success
+    2796  2019-01-01 09:00:37  compromised269        login failed  success
+    2798  2019-01-01 09:00:39  compromised269        login failed  success
+    2799  2019-01-01 09:00:40  compromised269        login failed  success
+    2802  2019-01-01 09:00:45  compromised269        login failed  success
+    2803  2019-01-01 09:00:46  compromised269        login failed  success
+    2804  2019-01-01 09:00:49  compromised269        login failed  success
+    2806  2019-01-01 09:00:54  compromised269        login failed  success
+    2807  2019-01-01 09:00:56  compromised269                 end  success
 
 
 
@@ -647,17 +830,28 @@ if activate_real_mode:
     print('Actions done by normal users who triggered rules:')
     print(day1_data[
 #         (day1_data['realtype'] == 'normal') & (day1_data['user'].isin(outcome['identified_users']))
-        (day1_data['realtype'] == 'normal') & (day1_data['user'] == 'normal660')
+        (day1_data['realtype'] == 'normal') & (day1_data['user'] == 'normal700')
     ][['time','user', 'action', 'status']])
 ```
 
     Actions done by normal users who triggered rules:
-                          time       user              action   status
-    15637  2019-01-01 23:04:02  normal660  login successfully  success
-    15643  2019-01-01 23:04:18  normal660           view item  success
-    15650  2019-01-01 23:04:43  normal660           view item  success
-    15666  2019-01-01 23:05:04  normal660            buy item  success
-    15671  2019-01-01 23:05:22  normal660            buy item  success
-    15675  2019-01-01 23:05:32  normal660              logout  success
-    15679  2019-01-01 23:05:45  normal660                 end  success
+                        time       user              action   status
+    214  2019-01-01 00:57:22  normal700  login successfully  success
+    215  2019-01-01 00:57:25  normal700           view item  success
+    216  2019-01-01 00:57:42  normal700           view item  success
+    217  2019-01-01 00:58:08  normal700           view item  success
+    219  2019-01-01 00:58:28  normal700            buy item  success
+    221  2019-01-01 00:58:41  normal700           view item  success
+    222  2019-01-01 00:58:47  normal700           view item  success
+    224  2019-01-01 00:58:52  normal700            buy item  success
+    226  2019-01-01 00:59:10  normal700           view item  success
+    229  2019-01-01 00:59:32  normal700           view item  success
+    230  2019-01-01 00:59:33  normal700           view item  success
+    234  2019-01-01 00:59:51  normal700            buy item  success
+    237  2019-01-01 01:00:01  normal700            buy item  success
+    241  2019-01-01 01:00:30  normal700            buy item  success
+    242  2019-01-01 01:00:34  normal700           view item  success
+    245  2019-01-01 01:01:00  normal700            buy item  success
+    246  2019-01-01 01:01:18  normal700              logout  success
+    248  2019-01-01 01:01:36  normal700                 end  success
 
